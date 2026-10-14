@@ -195,13 +195,13 @@ pub fn run(s: &mut Session, call: &ToolCall) -> Result<String, String> {
             if s.registry.get(&id).is_none() && !id.starts_with(rustgis_engine::plugins::PREFIX) {
                 return Err(format!("unknown command '{id}'; find ids with search_commands"));
             }
-            let (before, mark) = (layer_names(s), s.notice_mark());
+            let (before, mark) = (layer_snap(s), s.notice_mark());
             let r = s.run(&id, &params_arg(a)?).map_err(|e| error_with_notices(e, s, mark))?;
             with_notices(with_new_layers(r, s, &before), s, mark)
         }
         "run_tool" => {
             let tool = str_arg(a, "tool").ok_or("tool is required")?;
-            let (before, mark) = (layer_names(s), s.notice_mark());
+            let (before, mark) = (layer_snap(s), s.notice_mark());
             let r = s.run("gp.run", &json!({"tool": tool, "params": params_arg(a)?})).map_err(|e| error_with_notices(e, s, mark))?;
             with_notices(with_new_layers(r, s, &before), s, mark)
         }
@@ -260,13 +260,29 @@ fn limit_arg(a: &Value, default: usize, max: usize) -> usize {
     a.get("limit").and_then(Value::as_u64).map_or(default, |n| usize::try_from(n).unwrap_or(max)).clamp(1, max)
 }
 
-fn layer_names(s: &Session) -> Vec<(u32, String)> {
-    s.map().layers.iter().map(|l| (l.id, l.name.clone())).collect()
+/// The active map's identity and its layers, for spotting layers a command actually added.
+fn layer_snap(s: &Session) -> (usize, String, Vec<(u32, String)>) {
+    let m = s.map();
+    (s.project.active_map, m.name.clone(), m.layers.iter().map(|l| (l.id, l.name.clone())).collect())
 }
 
 /// A run's result, with the layers it added named (the next step's inputs).
-fn with_new_layers(r: Value, s: &Session, before: &[(u32, String)]) -> Value {
-    let added: Vec<String> = s.map().layers.iter().filter(|l| !before.iter().any(|(id, _)| *id == l.id)).map(|l| l.name.clone()).collect();
+///
+/// Switching or deleting maps changes which layer list we see; those layers were already on
+/// the other map and must not be reported as `layersAdded` (#212).
+fn with_new_layers(r: Value, s: &Session, before: &(usize, String, Vec<(u32, String)>)) -> Value {
+    let (before_idx, before_name, before_layers) = before;
+    let map_changed = s.project.active_map != *before_idx || !s.map().name.eq_ignore_ascii_case(before_name);
+    if map_changed {
+        return if r.is_null() { json!({"ok": true}) } else { r };
+    }
+    let added: Vec<String> = s
+        .map()
+        .layers
+        .iter()
+        .filter(|l| !before_layers.iter().any(|(id, _)| *id == l.id))
+        .map(|l| l.name.clone())
+        .collect();
     if added.is_empty() {
         return if r.is_null() { json!({"ok": true}) } else { r };
     }
