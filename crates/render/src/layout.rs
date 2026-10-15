@@ -275,19 +275,15 @@ fn outline_lonlat(pm: &mut Pixmap, map: &Map, view: &View, ring: &[Coord], color
     }
 }
 
-
 /// Formats a graticule meridian or parallel label.
 ///
 /// The Equator and prime meridian are `0°` (neither hemisphere). The antimeridian
 /// is `180°` without an E/W suffix. Other values keep the usual hemisphere letter.
 fn grid_degree_label(v: f64, pos: char, neg: char, step: f64) -> String {
     let d = if step < 1.0 { format!("{:.2}", v.abs()) } else { format!("{:.0}", v.abs()) };
-    // Exact 0 / ±180 come from the stepped loop; treat both signed zeros and ±180.
-    if v == 0.0 || v.abs() == 180.0 {
-        format!("{d}°")
-    } else {
-        format!("{d}°{}", if v > 0.0 { pos } else { neg })
-    }
+    // The stepped loop accumulates `+= step`, so 0 and ±180 can be off by rounding error.
+    let eps = step.abs() * 1e-6;
+    if v.abs() < eps || (v.abs() - 180.0).abs() < eps { format!("{d}°") } else { format!("{d}°{}", if v > 0.0 { pos } else { neg }) }
 }
 
 /// A graticule over a frame, labelled along its bottom and left edges.
@@ -692,5 +688,17 @@ mod tests {
         assert_eq!(grid_degree_label(-20.0, 'E', 'W', 10.0), "20°W");
         assert_eq!(grid_degree_label(0.5, 'N', 'S', 0.25), "0.50°N");
         assert_eq!(grid_degree_label(0.0, 'N', 'S', 0.25), "0.00°");
+        // Accumulated decimal steps miss 0 and 180 by rounding error.
+        let mut v = -0.5;
+        for _ in 0..5 {
+            v += 0.1;
+        }
+        assert_ne!(v, 0.0);
+        assert_eq!(grid_degree_label(v, 'N', 'S', 0.1), "0.00°");
+        let mut v = 179.5;
+        for _ in 0..5 {
+            v += 0.1;
+        }
+        assert_eq!(grid_degree_label(v, 'E', 'W', 0.1), "180.00°");
     }
 }
