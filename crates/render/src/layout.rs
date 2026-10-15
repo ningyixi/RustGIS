@@ -275,6 +275,21 @@ fn outline_lonlat(pm: &mut Pixmap, map: &Map, view: &View, ring: &[Coord], color
     }
 }
 
+
+/// Formats a graticule meridian or parallel label.
+///
+/// The Equator and prime meridian are `0°` (neither hemisphere). The antimeridian
+/// is `180°` without an E/W suffix. Other values keep the usual hemisphere letter.
+fn grid_degree_label(v: f64, pos: char, neg: char, step: f64) -> String {
+    let d = if step < 1.0 { format!("{:.2}", v.abs()) } else { format!("{:.0}", v.abs()) };
+    // Exact 0 / ±180 come from the stepped loop; treat both signed zeros and ±180.
+    if v == 0.0 || v.abs() == 180.0 {
+        format!("{d}°")
+    } else {
+        format!("{d}°{}", if v > 0.0 { pos } else { neg })
+    }
+}
+
 /// A graticule over a frame, labelled along its bottom and left edges.
 fn draw_grid(pm: &mut Pixmap, map: &Map, view: &View, g: &rustgis_map::layout::Grid) {
     let ppp = view.pixels_per_point as f32;
@@ -316,10 +331,7 @@ fn draw_grid(pm: &mut Pixmap, map: &Map, view: &View, g: &rustgis_map::layout::G
             pm.stroke_path(&p, &paint(g.color, 1.0), &stroke, Transform::identity(), None);
         }
     };
-    let fmt = |v: f64, pos: char, neg: char| {
-        let d = if step < 1.0 { format!("{:.2}", v.abs()) } else { format!("{:.0}", v.abs()) };
-        format!("{d}°{}", if v >= 0.0 { pos } else { neg })
-    };
+    let fmt = |v: f64, pos: char, neg: char| grid_degree_label(v, pos, neg, step);
     let label_color = Rgba::rgb(0x20, 0x20, 0x20);
     let mut lon = (ext.min_x / step).floor() * step;
     let mut n = 0;
@@ -664,5 +676,21 @@ mod tests {
         let x = pm.width() / 2;
         let inked = (0..pm.height()).filter(|&y| pm.pixel(x, y).is_some_and(|p| p.red() < 250)).count();
         assert!((1..=3).contains(&inked), "{inked} rows inked");
+    }
+
+    #[test]
+    fn grid_degree_label_omits_hemisphere_on_zero_and_antimeridian() {
+        // #210: Equator / prime meridian are 0°, antimeridian is 180°, not 0°N/0°E/180°E.
+        assert_eq!(grid_degree_label(0.0, 'N', 'S', 10.0), "0°");
+        assert_eq!(grid_degree_label(-0.0, 'N', 'S', 10.0), "0°");
+        assert_eq!(grid_degree_label(0.0, 'E', 'W', 10.0), "0°");
+        assert_eq!(grid_degree_label(180.0, 'E', 'W', 10.0), "180°");
+        assert_eq!(grid_degree_label(-180.0, 'E', 'W', 10.0), "180°");
+        assert_eq!(grid_degree_label(10.0, 'N', 'S', 10.0), "10°N");
+        assert_eq!(grid_degree_label(-10.0, 'N', 'S', 10.0), "10°S");
+        assert_eq!(grid_degree_label(20.0, 'E', 'W', 10.0), "20°E");
+        assert_eq!(grid_degree_label(-20.0, 'E', 'W', 10.0), "20°W");
+        assert_eq!(grid_degree_label(0.5, 'N', 'S', 0.25), "0.50°N");
+        assert_eq!(grid_degree_label(0.0, 'N', 'S', 0.25), "0.00°");
     }
 }
