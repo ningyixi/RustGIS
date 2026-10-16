@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use rustgis_ui_egui::{Inbox, RustGisApp, Services};
+
+use crate::parts::Notes;
 use wasm_bindgen::JsCast as _;
 
 const DATA_EXTS: &[&str] = &[
@@ -80,14 +82,21 @@ pub fn start() {
                 Box::new(move |cc| {
                     let inbox: Inbox = Inbox::default();
                     let font_inbox: Inbox = Inbox::default();
+                    let notes = Notes::default();
                     let q = query();
-                    let mut app =
-                        RustGisApp::with_sample().with_services(services(inbox.clone(), font_inbox, cc.egui_ctx.clone(), embedded));
+                    let project = params(&q, "project", 1).into_iter().next();
+                    let mut app = RustGisApp::with_sample().with_services(services(
+                        inbox.clone(),
+                        font_inbox,
+                        notes.clone(),
+                        cc.egui_ctx.clone(),
+                        embedded,
+                    ));
                     // Settings › Start-up, unless `?blank`, `?projection=EPSG:3010` (a preset id,
                     // `mercator`, `globe`) or `?extent=minLon,minLat,maxLon,maxLat` says otherwise
                     // for this visit.
                     let start = rustgis_ui_egui::Start {
-                        blank: (embedded || flag(&q, "blank")).then_some(true),
+                        blank: (embedded || project.is_some() || flag(&q, "blank")).then_some(true),
                         projection: param(&q, "projection").filter(|c| !c.is_empty()),
                         extent: param(&q, "extent").filter(|c| !c.is_empty()),
                     };
@@ -101,11 +110,26 @@ pub fn start() {
                             None => log::warn!("?lang={code}: no such interface language; following the browser's"),
                         }
                     }
+                    // `?project=<url>` opens a project (`.rgis`) by its web address: a whole map,
+                    // its layers, symbology and view, shared as one link. It replaces the project
+                    // when it lands, so the links that add to a project are left out beside it.
+                    if let Some(url) = &project {
+                        if let Err(e) = app.run("ui.openUrl", serde_json::json!({"url": url})) {
+                            app.session.notify(format!("?project={url}: {e}"), true);
+                        }
+                        let skipped: Vec<&str> =
+                            ["data", "stac", "style", "tiles", "zarr"].into_iter().filter(|k| !params(&q, k, 1).is_empty()).collect();
+                        if !skipped.is_empty() {
+                            let list = skipped.iter().map(|k| format!("?{k}=")).collect::<Vec<_>>().join(", ");
+                            app.session.notify(format!("?project= opens a whole project, so {list} links were left out"), false);
+                        }
+                    }
+                    let links = if project.is_some() { "" } else { q.as_str() };
                     // `?data=<url>` (repeatable) adds data by web address, downloaded in the
                     // background, the map zoomed to the first file that lands with something to
                     // show; `?style=<url>` adds a MapLibre style; `?tiles=<template>` a tile
                     // layer. Links that share a map. What fails is said in a notice.
-                    for url in params(&q, "data", 16) {
+                    for url in params(links, "data", 16) {
                         if let Err(e) = app.run("ui.addUrl", serde_json::json!({"url": url, "zoom": true})) {
                             app.session.notify(format!("?data={url}: {e}"), true);
                         }
@@ -114,7 +138,7 @@ pub fn start() {
                     // Planetary Computer one) or a collection (STAC Search opens on it).
                     // One link: the dialog follows one document at a time, so others are said to
                     // be skipped rather than lost.
-                    let stac = params(&q, "stac", 4);
+                    let stac = params(links, "stac", 4);
                     if let Some(url) = stac.first()
                         && let Err(e) = app.run("ui.stacLink", serde_json::json!({"url": url}))
                     {
@@ -124,7 +148,7 @@ pub fn start() {
                         app.session.notify(format!("only the first ?stac= link is opened ({} more were left out)", stac.len() - 1), false);
                     }
                     for (key, kind) in [("style", Some("style")), ("tiles", None)] {
-                        for url in params(&q, key, 8) {
+                        for url in params(links, key, 8) {
                             let mut p = serde_json::json!({"url": url});
                             if let Some(kind) = kind {
                                 p["kind"] = serde_json::json!(kind);
@@ -136,7 +160,7 @@ pub fn start() {
                     }
                     // `?zarr=<url>` opens Add Zarr Variable on a store, its variables listed.
                     // Read as `?data=` is, so a `+` in the address stays a `+`.
-                    if let Some(url) = params(&q, "zarr", 1).into_iter().next()
+                    if let Some(url) = params(links, "zarr", 1).into_iter().next()
                         && let Err(e) = app.run("ui.addZarr", serde_json::json!({"address": url}))
                     {
                         app.session.notify(format!("?zarr={url}: {e}"), true);
@@ -159,7 +183,7 @@ pub fn start() {
                     } else {
                         None
                     };
-                    Ok(Box::new(WebShell { app, inbox, dirty, embed }))
+                    Ok(Box::new(WebShell { app, inbox, notes, dirty, embed }))
                 }),
             )
             .await;
@@ -208,6 +232,8 @@ fn query() -> String {
 struct WebShell {
     app: RustGisApp,
     inbox: Inbox,
+    /// Notices from files read off the frame.
+    notes: Notes,
     dirty: Rc<Cell<bool>>,
     embed: Option<Embed>,
 }
@@ -312,18 +338,23 @@ impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
         for f in dropped {
-            let inbox = self.inbox.clone();
+            let (inbox, notes) = (self.inbox.clone(), self.notes.clone());
             let ctx = ctx.clone();
+            let Some(file) = f.web_file().cloned() else {
+                log::error!("a dropped file without its browser file");
+                continue;
+            };
             wasm_bindgen_futures::spawn_local(async move {
-                let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped.geojson".into());
-                match f.bytes_async().await {
-                    Ok(bytes) => {
-                        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
-                        ctx.request_repaint();
-                    }
-                    Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
+                let name = file.name();
+                if let Some(bytes) = crate::parts::read_file(file, notes).await {
+                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
                 }
+                ctx.request_repaint();
             });
+        }
+        let notes = std::mem::take(&mut *self.notes.lock().unwrap_or_else(|e| e.into_inner()));
+        for (text, error) in notes {
+            self.app.session.notify(text, error);
         }
         if let Some(embed) = &mut self.embed {
             embed.exchange(&mut self.app, ctx);
@@ -499,7 +530,7 @@ async fn http(req: rustgis_ui_egui::rustgis_assistant::HttpRequest) -> Result<ru
 
 /// The browser's services. Embedded, settings live in memory for the visit: the page that embeds
 /// the app must not read what the user saved on the site.
-fn services(inbox: Inbox, font_inbox: Inbox, ctx: egui::Context, embedded: bool) -> Services {
+fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool) -> Services {
     // Map tiles come through the browser's fetch (the app repaints when they arrive).
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_fetcher(|url, done| {
         wasm_bindgen_futures::spawn_local(async move { done(fetch_bytes(&url).await) });
@@ -552,10 +583,20 @@ fn services(inbox: Inbox, font_inbox: Inbox, ctx: egui::Context, embedded: bool)
         font_inbox: Some(font_inbox),
         open_async: Some(Box::new(move |purpose: &str| {
             let inbox = open_inbox.clone();
+            let notes = notes.clone();
             let ctx = ctx.clone();
             // A file picked for Add Delimited Text carries its dialog's options.
-            let mark = if purpose == "text" { rustgis_ui_egui::DELIMITED_PICK } else { "" };
-            let dialog = if purpose == "project" {
+            // So does a file picked for a tool's file parameter, which goes to the Tools pane.
+            let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
+            let mark = match (purpose, tool_exts) {
+                ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
+                (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
+                _ => "",
+            };
+            let dialog = if let Some(exts) = tool_exts {
+                let exts: Vec<&str> = exts.split(',').filter(|e| !e.is_empty()).collect();
+                if exts.is_empty() { rfd::AsyncFileDialog::new() } else { rfd::AsyncFileDialog::new().add_filter(exts.join(", "), &exts) }
+            } else if purpose == "project" {
                 rfd::AsyncFileDialog::new().add_filter("RustGIS project", &["rgis", "rgisx"])
             } else if purpose == "item" {
                 rfd::AsyncFileDialog::new().add_filter(
@@ -582,8 +623,10 @@ fn services(inbox: Inbox, font_inbox: Inbox, ctx: egui::Context, embedded: bool)
                 let files: Vec<rfd::FileHandle> =
                     if many { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
                 for file in files {
-                    let bytes = file.read().await;
-                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((format!("{mark}{}", file.file_name()), bytes));
+                    let name = file.file_name();
+                    if let Some(bytes) = crate::parts::read_file(file.inner().clone(), notes.clone()).await {
+                        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((format!("{mark}{name}"), bytes));
+                    }
                 }
                 ctx.request_repaint();
             });

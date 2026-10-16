@@ -51,6 +51,14 @@ pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 /// inbox, so the dialog's options go with that file and no other (a drop, another picker).
 pub const DELIMITED_PICK: &str = "\u{1}delimited:";
 
+/// The `open_async` purpose for a tool's file parameter, followed by the extensions it offers
+/// (`toolfile:nc,nc4`; none for any file).
+pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
+
+/// Starts the name of a file the web shell's tool file picker put in the inbox: it goes to the
+/// Tools pane's file parameter, not onto the map.
+pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
+
 /// A result an asynchronous service fills in when it's done (the app polls it each frame).
 pub type Slot<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
 
@@ -260,7 +268,7 @@ pub struct UiState {
     pub about: bool,
     pub shortcuts: bool,
     pub tab_strip_rect: Option<egui::Rect>,
-    /// Tabs hidden from the ribbon (Help › Customize › Ribbon).
+    /// Tabs hidden from the ribbon (Settings › Customize › Ribbon).
     pub hidden_tabs: Vec<String>,
     /// Extra Quick Access Toolbar commands.
     pub quick_access: Vec<String>,
@@ -276,6 +284,10 @@ pub struct UiState {
     /// Data downloading from web addresses (Add Data › From URL): the address, the parameters to
     /// add it with, and where the download lands.
     pub downloads: Vec<(u64, String, Value, Slot<Result<Vec<u8>, String>>)>,
+    /// A project downloading from its web address (`ui.openUrl`, a `?project=` link): the
+    /// session's download id, the address and where the download lands. A later one replaces it;
+    /// opening another project meanwhile drops it.
+    pub project_download: Option<(u64, String, Slot<Result<Vec<u8>, String>>)>,
     /// The SQL pane's editor, results and history.
     pub sql: sqlpane::State,
     /// GeoTIFFs, FlatGeobufs and GeoParquets by address whose headers are being read: those
@@ -350,6 +362,7 @@ impl Default for UiState {
             web_file: None,
             pending_csv: None,
             downloads: Vec::new(),
+            project_download: None,
             sql: Default::default(),
             cog_probes: Vec::new(),
             link_zoomed: false,
@@ -396,6 +409,18 @@ pub struct RustGisApp {
     pub quit_requested: bool,
     logo: Option<egui::TextureHandle>,
     pub services: Services,
+    /// The MCP relay for `rustgis-cli mcp --attach`: a loopback listener on the session this app
+    /// already has open, started by the `ui.mcpRelay` command and off until then.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub relay: Option<rustgis_assistant::relay::Relay>,
+    /// The frame's `egui::Context`, kept so `ui.mcpRelay` can hand the relay its wake callback:
+    /// a queued message asks for a repaint, or it waits for the user to move the mouse.
+    #[cfg(not(target_arch = "wasm32"))]
+    frame_ctx: Option<egui::Context>,
+    /// Set when `ui.mcpRelay` started the relay before the first frame, where there is no context
+    /// to give its wake callback yet: `logic` installs the wake as soon as a context exists.
+    #[cfg(not(target_arch = "wasm32"))]
+    relay_wake_pending: bool,
     /// Extra font faces installed with the interface fonts: (name, face, region). The current
     /// language's region comes right after the interface font, so its glyph shapes win; the others
     /// are last-resort fallbacks. Faces are shared, so reinstalling copies nothing.
@@ -441,6 +466,12 @@ impl RustGisApp {
             quit_requested: false,
             logo: None,
             services: Services::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            relay: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            frame_ctx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            relay_wake_pending: false,
             extra_fonts: Vec::new(),
             installed_region: None,
             fonts_dirty: false,
@@ -606,8 +637,13 @@ impl RustGisApp {
     }
 
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
-    /// Delimited Text for it, or is read with a script's options.
+    /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
+    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
+        if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
+            panes::received_file(self, name, bytes);
+            return Ok(Value::Null);
+        }
         match name.strip_prefix(DELIMITED_PICK) {
             Some(name) => match self.ui.pending_csv.take() {
                 Some(Value::Null) => dialogs::open_csv(self, name, dialogs::CsvSource::Bytes(bytes.to_vec())),
@@ -861,6 +897,8 @@ impl RustGisApp {
         // names it again).
         if r.is_ok() && matches!(id, "project.new" | "project.sample" | "project.open" | "project.openText" | "project.fromTemplate") {
             self.ui.web_file = None;
+            // A deletion asked for in the old project never reaches a namesake in the new one.
+            self.map.deleting = None;
         }
         // Sources added, saved or made favourites are kept with the preferences.
         sourcespane::save(self);
@@ -1006,6 +1044,50 @@ impl RustGisApp {
             "ui.commandSearch" => self.ui.command_search = Some(String::new()),
             "ui.about" => self.ui.about = true,
             "ui.checkUpdate" => self.update.check(),
+            // The MCP relay for `rustgis-cli mcp --attach`: starts a loopback listener off until
+            // asked. Running the command again reports its address; the app owns its lifetime.
+            #[cfg(not(target_arch = "wasm32"))]
+            "ui.mcpRelay" => {
+                if p.get("stop").and_then(Value::as_bool).unwrap_or(false) {
+                    // Idempotent: stopping an already stopped relay is not an error.
+                    if let Some(relay) = self.relay.take() {
+                        relay.stop();
+                        self.session.notify(tl!("MCP relay stopped").to_string(), false);
+                    }
+                } else if let Some(relay) = &self.relay {
+                    // A named port is a request to listen there; silently ignoring it would hide
+                    // the mistake, so it is refused with the way out instead of rebinding.
+                    if let Some(asked) = p.get("port").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok())
+                        && asked != relay.port()
+                    {
+                        return Err(i18n::fmt(
+                            "MCP relay is already listening on 127.0.0.1:{port}; stop it first to use port {asked}",
+                            &[("port", &relay.port().to_string()), ("asked", &asked.to_string())],
+                        ));
+                    }
+                    let text = i18n::fmt("MCP relay listening on 127.0.0.1:{port}", &[("port", &relay.port().to_string())]);
+                    self.session.notify(text, false);
+                } else {
+                    let port = p
+                        .get("port")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u16::try_from(n).ok())
+                        .unwrap_or(rustgis_assistant::relay::DEFAULT_PORT);
+                    let relay = rustgis_assistant::relay::Relay::start(port)?;
+                    // The relay only queues; the frame runs the messages, so a queued message
+                    // asks for the frame that will run it. Before the first frame there is no
+                    // context yet; `logic` gives the relay its wake once one exists.
+                    if let Some(ctx) = &self.frame_ctx {
+                        let ctx = ctx.clone();
+                        relay.set_wake(Box::new(move || ctx.request_repaint()));
+                    } else {
+                        self.relay_wake_pending = true;
+                    }
+                    let text = i18n::fmt("MCP relay listening on 127.0.0.1:{port}", &[("port", &relay.port().to_string())]);
+                    self.session.notify(text, false);
+                    self.relay = Some(relay);
+                }
+            }
             "ui.plugins" => {
                 self.plugins.open = p.get("open").and_then(Value::as_bool).unwrap_or(!self.plugins.open);
                 if let Some(url) = p.get("registry").and_then(Value::as_str) {
@@ -1077,6 +1159,22 @@ impl RustGisApp {
                         }
                         None => dialogs::open_csv(self, &path.clone(), dialogs::CsvSource::Path(path)),
                     };
+                }
+            }
+            // A project by its web address (a `?project=` link): downloaded off the frame, opened
+            // when it lands, in place of the open project (see `poll_downloads`).
+            "ui.openUrl" => {
+                let url = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
+                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
+                let land = slot.clone();
+                rustgis_engine::render::rustgis_tiles::cache::download(
+                    url,
+                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+                );
+                self.session.notify(i18n::fmt("Opening {url}…", &[("url", url)]), false);
+                let id = self.session.download_started();
+                if let Some((old, ..)) = self.ui.project_download.replace((id, url.to_string(), slot)) {
+                    self.session.download_failed(old);
                 }
             }
             // A STAC item's or collection's address (a `?stac=` link): STAC Search opens on it,
@@ -1575,18 +1673,21 @@ impl RustGisApp {
             "ui.linkCursors" => self.ws.link_cursors = p.get("on").and_then(Value::as_bool).unwrap_or(!self.ws.link_cursors),
             // A second map beside the active one (for linked views and cursors).
             "ui.splitView" => {
-                let others: Vec<usize> = (0..self.session.project.maps.len()).filter(|i| *i != self.session.project.active_map).collect();
-                self.ws.split = match (self.ws.split, p.get("map").and_then(Value::as_str)) {
-                    (_, Some(n)) => Some(
-                        self.session
-                            .project
-                            .maps
-                            .iter()
-                            .position(|m| m.name.eq_ignore_ascii_case(n))
-                            .ok_or_else(|| format!("no map '{n}'"))?,
+                // On while its map is there: a name left by a deleted or renamed map counts as off.
+                let on = mapview::split_map(self).is_some();
+                let (maps, active) = (&self.session.project.maps, self.session.project.active_map);
+                self.ws.split = match (on, p.get("map").and_then(Value::as_str)) {
+                    (_, Some(n)) => {
+                        Some(maps.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'"))?.name.clone())
+                    }
+                    (true, None) => None,
+                    (false, None) => Some(
+                        maps.iter()
+                            .enumerate()
+                            .find(|(i, _)| *i != active)
+                            .map(|(_, m)| m.name.clone())
+                            .ok_or("add a second map first (Data › New Map)")?,
                     ),
-                    (Some(_), None) => None,
-                    (None, None) => Some(*others.first().ok_or("add a second map first (Data › New Map)")?),
                 };
             }
             "ui.paneSet" => {
@@ -1610,8 +1711,8 @@ impl RustGisApp {
             }
             "ui.customizeRibbon" => {
                 let tab = p.get("tab").and_then(Value::as_str).ok_or("tab is required")?.to_string();
-                if tab == "Help" {
-                    return Err("the Help tab always shows".into());
+                if ribbon::FIXED_TABS.contains(&tab.as_str()) {
+                    return Err(format!("the {tab} tab always shows"));
                 }
                 if self.ui.hidden_tabs.contains(&tab) {
                     self.ui.hidden_tabs.retain(|t| *t != tab);
@@ -1807,6 +1908,52 @@ impl RustGisApp {
     /// Adds the data downloads that have landed (Add Data › From URL). The bytes go to the session
     /// as they are; a download of a project that has since been closed is dropped.
     fn poll_downloads(&mut self) {
+        let landed = self.ui.project_download.as_ref().and_then(|(id, url, slot)| {
+            let r = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            r.map(|r| (*id, url.clone(), r))
+        });
+        if let Some((id, url, r)) = landed {
+            self.ui.project_download = None;
+            // Another project opened while this one downloaded: it stays.
+            if !self.session.download_done(id) {
+                if r.is_ok() {
+                    self.session.notify(
+                        i18n::fmt("{url}: downloaded after another project was opened, so it wasn't opened", &[("url", &url)]),
+                        false,
+                    );
+                }
+                return self.poll_data_downloads();
+            }
+            if let Err(e) = r.and_then(|bytes| self.open_project_bytes(project_file_name(&url), &bytes)) {
+                self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true);
+            }
+        }
+        self.poll_data_downloads();
+    }
+
+    /// Opens a downloaded project: a `.rgispkg` package, or project JSON named after its file (or
+    /// keeping its own name when the address has none). Unlike [`Self::open_bytes`], it never takes
+    /// a picker's pending item: the download isn't the file the user is picking.
+    fn open_project_bytes(&mut self, file: Option<&str>, bytes: &[u8]) -> Result<Value, String> {
+        let package = file.is_some_and(|f| f.to_ascii_lowercase().ends_with(".rgispkg"));
+        let text = if package {
+            rustgis_engine::cmd::items::package_text(bytes)?
+        } else {
+            std::str::from_utf8(bytes).map_err(|_| "not a RustGIS project".to_string())?.to_string()
+        };
+        let mut p = json!({"text": text});
+        if let Some(f) = file.filter(|_| !package) {
+            p["fileName"] = json!(f);
+        }
+        let r = self.run("project.openText", p);
+        if r.is_ok() && !package {
+            self.ui.web_file = Some(format!("{}.rgis", self.session.project.name));
+        }
+        self.map.invalidate();
+        r
+    }
+
+    fn poll_data_downloads(&mut self) {
         // GeoTIFFs, FlatGeobufs and GeoParquets whose headers are in: read in place, or
         // downloaded whole.
         let mut probed = Vec::new();
@@ -1958,12 +2105,36 @@ impl RustGisApp {
 
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        // The MCP relay: what attached agents sent runs here, on this session, before the frame
+        // draws (Session lives on this thread; the listener only queues messages).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.frame_ctx = Some(ctx.clone());
+            if let Some(relay) = &self.relay {
+                // A relay started before the first frame has no wake yet; now there is a context
+                // to ask for repaints with.
+                if self.relay_wake_pending {
+                    let ctx = ctx.clone();
+                    relay.set_wake(Box::new(move || ctx.request_repaint()));
+                    self.relay_wake_pending = false;
+                }
+                relay.poll(&mut self.session);
+            }
+        }
         // Fonts installed last frame are active now.
         self.fonts_pending = false;
         i18n::set_current(self.lang());
         rustgis_engine::plugins::set_language(self.lang().code());
         panes::poll_geolibre(self, ctx);
+        panes::poll_plugin_run(self, ctx);
         self.poll_downloads();
+        // Addresses commands asked for where they couldn't download themselves (the browser):
+        // fetched off the frame and added when they land, as Add Data › From URL does.
+        for p in self.session.take_url_requests() {
+            if let Err(e) = self.run("ui.addUrl", p) {
+                self.session.notify(e, true);
+            }
+        }
         sqlpane::poll(self, ctx);
         self.poll_service();
         // Sources the AI Assistant or a background add brought in (not through `run`) are kept
@@ -2103,6 +2274,7 @@ impl RustGisApp {
             });
         }
         dialogs::show(self, &ctx);
+        mapview::confirm_delete(self, &ctx);
         pluginsui::show(self, &ctx);
         update::show(self, &ctx);
         chrome::command_search(self, &ctx);
@@ -2123,4 +2295,12 @@ impl RustGisApp {
             self.sent_title = title;
         }
     }
+}
+
+/// The file name at the end of a project's web address, when it names a project or a project
+/// package; the project is then opened as that file would be.
+fn project_file_name(url: &str) -> Option<&str> {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let last = path.rsplit('/').next().unwrap_or("");
+    (rustgis_engine::project::is_project_file(last) || last.to_ascii_lowercase().ends_with(".rgispkg")).then_some(last)
 }
