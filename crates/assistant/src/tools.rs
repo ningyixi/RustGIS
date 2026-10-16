@@ -269,13 +269,15 @@ fn layer_snap(s: &Session) -> Vec<(String, Vec<u32>)> {
 ///
 /// Layers are compared with the same map's layers before the run, so switching or deleting maps
 /// does not report the newly visible map's layers as `layersAdded` (#212). Map names are unique, so
-/// the map is found by name, or at the same place when a rename kept the number of maps.
+/// the map is found by name, or at the same place when only its name changed (a rename).
 fn with_new_layers(r: Value, s: &Session, before: &[(String, Vec<u32>)]) -> Value {
     let m = s.map();
-    let same = before
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(&m.name))
-        .or_else(|| if before.len() == s.project.maps.len() { before.get(s.project.active_map) } else { None });
+    let active = s.project.active_map;
+    // A rename changes only the active map's name; every other map keeps its own.
+    let renamed = before.len() == s.project.maps.len()
+        && s.project.maps.iter().zip(before).enumerate().all(|(i, (now, (was, _)))| i == active || now.name == *was);
+    let same =
+        before.iter().find(|(name, _)| name.eq_ignore_ascii_case(&m.name)).or_else(|| if renamed { before.get(active) } else { None });
     let had = same.map_or(&[][..], |(_, ids)| ids.as_slice());
     let added: Vec<String> = m.layers.iter().filter(|l| !had.contains(&l.id)).map(|l| l.name.clone()).collect();
     if added.is_empty() {
