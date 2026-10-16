@@ -276,13 +276,8 @@ fn with_new_layers(r: Value, s: &Session, before: &(usize, String, Vec<(u32, Str
     if map_changed {
         return if r.is_null() { json!({"ok": true}) } else { r };
     }
-    let added: Vec<String> = s
-        .map()
-        .layers
-        .iter()
-        .filter(|l| !before_layers.iter().any(|(id, _)| *id == l.id))
-        .map(|l| l.name.clone())
-        .collect();
+    let added: Vec<String> =
+        s.map().layers.iter().filter(|l| !before_layers.iter().any(|(id, _)| *id == l.id)).map(|l| l.name.clone()).collect();
     if added.is_empty() {
         return if r.is_null() { json!({"ok": true}) } else { r };
     }

@@ -214,9 +214,24 @@ fn map_switch_and_remove_do_not_report_layers_added() {
     assert!(remove.get("layersAdded").is_none(), "map.remove must not report remaining layers as added: {remove}");
     assert_eq!(s.project.maps.len(), 1);
 
+    // Removing the active, populated map switches to another map's layers: still nothing added.
+    tools::run(&mut s, &t("run_command", json!({"command": "map.new", "params": {"name": "Gone"}}))).unwrap();
+    let pts = json!({"fileName": "pts.csv", "text": "lon,lat\n1,2\n"});
+    tools::run(&mut s, &t("run_command", json!({"command": "layer.addDataText", "params": pts}))).unwrap();
+    assert_eq!(s.map().name, "Gone");
+    let remove_active: Value =
+        serde_json::from_str(&tools::run(&mut s, &t("run_command", json!({"command": "map.remove", "params": {"name": "Gone"}}))).unwrap())
+            .unwrap();
+    assert!(remove_active.get("layersAdded").is_none(), "removing the active map must not report the next map's layers: {remove_active}");
+    assert_eq!(s.map().name, world);
+
     // Real adds still report layersAdded.
-    let buffered = tools::run(&mut s, &t("run_tool", json!({"tool": "buffer", "params": {"input": "Cities", "distance": 100}})));
-    assert!(buffered.as_deref().is_ok_and(|r| r.contains("layersAdded")), "{buffered:?}");
+    let buffered: Value = serde_json::from_str(
+        &tools::run(&mut s, &t("run_tool", json!({"tool": "buffer", "params": {"input": "Cities", "distance": 100}}))).unwrap(),
+    )
+    .unwrap();
+    let added = buffered.get("layersAdded").and_then(Value::as_array);
+    assert!(added.is_some_and(|a| !a.is_empty()), "buffer must name the layer it added: {buffered}");
 }
 
 #[test]
