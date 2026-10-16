@@ -217,13 +217,28 @@ fn map_switch_and_remove_do_not_report_layers_added() {
     // Removing the active, populated map switches to another map's layers: still nothing added.
     tools::run(&mut s, &t("run_command", json!({"command": "map.new", "params": {"name": "Gone"}}))).unwrap();
     let pts = json!({"fileName": "pts.csv", "text": "lon,lat\n1,2\n"});
-    tools::run(&mut s, &t("run_command", json!({"command": "layer.addDataText", "params": pts}))).unwrap();
+    tools::run(&mut s, &t("run_command", json!({"command": "layer.addDataText", "params": pts.clone()}))).unwrap();
     assert_eq!(s.map().name, "Gone");
     let remove_active: Value =
         serde_json::from_str(&tools::run(&mut s, &t("run_command", json!({"command": "map.remove", "params": {"name": "Gone"}}))).unwrap())
             .unwrap();
     assert!(remove_active.get("layersAdded").is_none(), "removing the active map must not report the next map's layers: {remove_active}");
     assert_eq!(s.map().name, world);
+
+    // Renaming the active map keeps its layers: nothing added.
+    let renamed: Value = serde_json::from_str(
+        &tools::run(&mut s, &t("run_command", json!({"command": "map.rename", "params": {"name": "Renamed"}}))).unwrap(),
+    )
+    .unwrap();
+    assert!(renamed.get("layersAdded").is_none(), "map.rename must not report the map's layers as added: {renamed}");
+
+    // A layer added to a map the command also created is still reported.
+    tools::run(&mut s, &t("run_command", json!({"command": "map.new", "params": {"name": "Fresh"}}))).unwrap();
+    let fresh: Value =
+        serde_json::from_str(&tools::run(&mut s, &t("run_command", json!({"command": "layer.addDataText", "params": pts}))).unwrap())
+            .unwrap();
+    assert!(fresh.get("layersAdded").and_then(Value::as_array).is_some_and(|a| a.len() == 1), "{fresh}");
+    tools::run(&mut s, &t("run_command", json!({"command": "map.activate", "params": {"name": "Renamed"}}))).unwrap();
 
     // Real adds still report layersAdded.
     let buffered: Value = serde_json::from_str(

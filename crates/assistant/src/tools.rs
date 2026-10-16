@@ -260,24 +260,24 @@ fn limit_arg(a: &Value, default: usize, max: usize) -> usize {
     a.get("limit").and_then(Value::as_u64).map_or(default, |n| usize::try_from(n).unwrap_or(max)).clamp(1, max)
 }
 
-/// The active map's identity and its layers, for spotting layers a command actually added.
-fn layer_snap(s: &Session) -> (usize, String, Vec<(u32, String)>) {
-    let m = s.map();
-    (s.project.active_map, m.name.clone(), m.layers.iter().map(|l| (l.id, l.name.clone())).collect())
+/// Every map's name and layer ids, for spotting the layers a command actually added.
+fn layer_snap(s: &Session) -> Vec<(String, Vec<u32>)> {
+    s.project.maps.iter().map(|m| (m.name.clone(), m.layers.iter().map(|l| l.id).collect())).collect()
 }
 
 /// A run's result, with the layers it added named (the next step's inputs).
 ///
-/// Switching or deleting maps changes which layer list we see; those layers were already on
-/// the other map and must not be reported as `layersAdded` (#212).
-fn with_new_layers(r: Value, s: &Session, before: &(usize, String, Vec<(u32, String)>)) -> Value {
-    let (before_idx, before_name, before_layers) = before;
-    let map_changed = s.project.active_map != *before_idx || !s.map().name.eq_ignore_ascii_case(before_name);
-    if map_changed {
-        return if r.is_null() { json!({"ok": true}) } else { r };
-    }
-    let added: Vec<String> =
-        s.map().layers.iter().filter(|l| !before_layers.iter().any(|(id, _)| *id == l.id)).map(|l| l.name.clone()).collect();
+/// Layers are compared with the same map's layers before the run, so switching or deleting maps
+/// does not report the newly visible map's layers as `layersAdded` (#212). Map names are unique, so
+/// the map is found by name, or at the same place when a rename kept the number of maps.
+fn with_new_layers(r: Value, s: &Session, before: &[(String, Vec<u32>)]) -> Value {
+    let m = s.map();
+    let same = before
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&m.name))
+        .or_else(|| if before.len() == s.project.maps.len() { before.get(s.project.active_map) } else { None });
+    let had = same.map_or(&[][..], |(_, ids)| ids.as_slice());
+    let added: Vec<String> = m.layers.iter().filter(|l| !had.contains(&l.id)).map(|l| l.name.clone()).collect();
     if added.is_empty() {
         return if r.is_null() { json!({"ok": true}) } else { r };
     }
